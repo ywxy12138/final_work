@@ -1,8 +1,23 @@
-import sys
 import os
+import re
+import difflib
+import chardet
+import csv
+import requests
+import sys
+
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+
+def preprocess_code(code):
+    code = re.sub(r'#.*?$|\'\'\'.*?\'\'\'|""".*?"""', '', code, flags=re.DOTALL | re.MULTILINE)
+    code = re.sub(r'\s+', ' ', code)
+    return code.strip()
+
+def compare_similarity(code1, code2):
+    return difflib.SequenceMatcher(None, code1, code2).ratio()
 
 class CodePlagiarismChecker(QMainWindow):
     def __init__(self):
@@ -10,26 +25,19 @@ class CodePlagiarismChecker(QMainWindow):
         self.setWindowTitle("Python 代码查重工具")
         self.setGeometry(100, 100, 1200, 800)
 
-        # 初始化数据库
-        # self.init_db()
-        self.files={}
+        self.files = {}
+        self.current_file = None
+        self.mode = 0  # 默认为一对多模式
 
-        # 创建UI
         self.CreateUI()
-
-        # 显示登录时间
         self.show_login_time()
 
-
     def CreateUI(self):
-        # 主布局
         main_widget = QWidget()
         main_layout = QVBoxLayout()
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
 
-
-        # 顶部控制栏
         control_layout = QHBoxLayout()
         self.btn_import = QPushButton("导入文件")
         self.btn_import.clicked.connect(self.import_files)
@@ -39,58 +47,36 @@ class CodePlagiarismChecker(QMainWindow):
         control_layout.addWidget(self.btn_check)
         main_layout.addLayout(control_layout)
 
-
-        # 分割视图
         splitter = QSplitter(Qt.Horizontal)
 
-
-        # 左侧：文件列表
         self.file_table = QTableWidget()
         self.file_table.setColumnCount(1)
         self.file_table.setHorizontalHeaderLabels(["文件名称"])
         self.file_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.file_table.cellClicked.connect(self.display_similarity_for_file)
 
-
-        # 中间：结果列表
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(3)
-        self.result_table.setHorizontalHeaderLabels(["文件1", "重复率", "抄袭标记"])
+        self.result_table.setColumnCount(4)
+        self.result_table.setHorizontalHeaderLabels(["对比文件", "重复率", "抄袭标记", "人工审核"])
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.result_table.cellDoubleClicked.connect(self.show_code_comparison)
 
-
-        # 右侧：代码对比区域
         self.code_tabs = QTabWidget()
-        self.code_view1 = QTextEdit()
-        self.code_view2 = QTextEdit()
-        self.code_view1.setReadOnly(True)
-        self.code_view2.setReadOnly(True)
+        self.code_tabs.setTabsClosable(True)
+        self.code_tabs.tabCloseRequested.connect(self.code_tabs.removeTab)
 
-
-        # 添加高亮器
-        # self.highlighter1 = CodeHighlighter(self.code_view1.document())
-        # self.highlighter2 = CodeHighlighter(self.code_view2.document())
-
-
-        # 组合分割视图
         splitter.addWidget(self.file_table)
         splitter.addWidget(self.result_table)
         splitter.addWidget(self.code_tabs)
-        splitter.setSizes([200, 400, 400])
+        splitter.setSizes([200, 400, 600])
         main_layout.addWidget(splitter)
 
-
-        # 状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-
-        # 创建菜单
         self.create_menus()
 
-
     def create_menus(self):
-        # 文件菜单
         file_menu = self.menuBar().addMenu("文件")
 
         import_action = QAction("导入文件", self)
@@ -98,235 +84,207 @@ class CodePlagiarismChecker(QMainWindow):
         file_menu.addAction(import_action)
 
         export_action = QAction("导出结果", self)
-        # export_action.triggered.connect(self.export_results)
         file_menu.addAction(export_action)
 
-
-        # 历史记录菜单
         history_menu = self.menuBar().addMenu("历史记录")
-        # self.load_history_menu(history_menu)
 
-
-        # 查看菜单
         view_menu = self.menuBar().addMenu("查看")
+        self.mode_label = QLabel("当前: 一对多模式")
+        mode_widget_action = QWidgetAction(self)
+        mode_widget_action.setDefaultWidget(self.mode_label)
+        view_menu.addAction(mode_widget_action)
+
+        one_to_many_action = QAction("一对多模式", self)
+        one_to_many_action.triggered.connect(lambda: self.switch_mode(0))
         group_action = QAction("群体自查模式", self)
-        # group_action.triggered.connect(self.switch_to_group_mode)
+        group_action.triggered.connect(lambda: self.switch_mode(1))
+        view_menu.addAction(one_to_many_action)
         view_menu.addAction(group_action)
 
-
-    def init_db(self):
-        # 初始化数据库需要的操作
-        pass
-
+    def switch_mode(self, mode):
+        self.mode = mode
+        self.mode_label.setText("当前: 一对多模式" if mode == 0 else "当前: 群体自查模式")
 
     def show_login_time(self):
-        # 在状态栏显示登录时间
         login_time = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
         self.status_bar.showMessage(f"登录时间: {login_time}")
 
-
     def import_files(self):
-        """导入文件夹中的所有Python文件"""
-        # 获取文件夹路径
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择包含Python文件的文件夹",
-            "",
-            QFileDialog.ShowDirsOnly
-        )
-
+        folder_path = QFileDialog.getExistingDirectory(self, "选择包含Python文件的文件夹", "", QFileDialog.ShowDirsOnly)
         if not folder_path:
             return
 
-        # 遍历文件夹中的所有Python文件
-        imported_count = 0
+        imported_files = []
+        errors = []
+
         for root, _, filenames in os.walk(folder_path):
             for filename in filenames:
                 if filename.endswith('.py'):
                     file_path = os.path.join(root, filename)
                     try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-
-                        # 存储文件数据
+                        with open(file_path, 'rb') as f:
+                            file_content = f.read()
+                        imported_files.append(('files', (filename, file_content, 'text/x-python')))
                         self.files[filename] = {
                             'path': file_path,
-                            'content': content
+                            'content': file_content.decode('utf-8', errors='ignore'),
+                            'file_id': None
                         }
-                        imported_count += 1
                     except Exception as e:
-                        QMessageBox.warning(
-                            self,
-                            "读取错误",
-                            f"无法读取文件 {file_path}:\n{str(e)}"
-                        )
+                        errors.append(f"文件 {filename}: {str(e)}")
 
-        if imported_count > 0:
-            # 更新文件列表显示
-            self.display_files()
-            # 更新状态栏
-            self.status_bar.showMessage(
-                f"成功导入 {imported_count} 个Python文件",
-                3000
-            )
-        else:
-            QMessageBox.information(
-                self,
-                "无Python文件",
-                "所选文件夹中没有找到Python文件"
-            )
+        if not imported_files:
+            QMessageBox.information(self, "无Python文件", "所选文件夹中没有找到Python文件")
+            return
 
+        data = {
+            'uploader_id': 0,
+            'uploader_name': 'user'
+        }
+        headers = {
+            'Authorization': 'Bearer xxx'
+        }
+        api_url = "http://101.201.83.112:8080/api/plagiarism/CodeUpload/batch/"
+
+        try:
+            response = requests.post(api_url, data=data, files=imported_files, headers=headers, timeout=20)
+            if response.status_code == 200:
+                response_data = response.json()
+                for item in response_data.get('results', []):
+                    name = item['filename']
+                    file_id = item['file_id']
+                    if name in self.files:
+                        self.files[name]['file_id'] = file_id
+                self.status_bar.showMessage(f"成功上传 {len(imported_files)} 个Python文件到服务器", 10000)
+                self.display_files()
+            else:
+                QMessageBox.warning(self, "上传失败", f"服务器返回错误: {response.status_code}\n{response.text}")
+        except Exception as e:
+            QMessageBox.critical(self, "连接错误", f"无法连接到服务器:\n{str(e)}")
+
+        if errors:
+            error_msg = "\n".join(errors[:5])
+            if len(errors) > 5:
+                error_msg += f"\n...及其他{len(errors) - 5}个错误"
+            QMessageBox.warning(self, "部分文件读取失败", f"以下文件读取时出错:\n{error_msg}")
+
+        print('import success')
 
     def display_files(self):
-        # 在文件列表中显示文件需要的操作
         self.file_table.setRowCount(len(self.files))
+        self.current_file = None
+        self.result_table.setRowCount(0)
+        self.code_tabs.clear()
 
         for row, file_name in enumerate(self.files.keys()):
             item = QTableWidgetItem(file_name)
-            item.setFlags(item.flags() ^ Qt.ItemIsEditable)  # 设置为不可编辑
+            item.setFlags(item.flags() ^ Qt.ItemIsEditable)
             self.file_table.setItem(row, 0, item)
-        pass
-
-
-    def run_plagiarism_check(self):
-        if not self.files:
-            QMessageBox.warning(self, "警告", "请先导入 Python 文件夹！")
-            return
-
-        files = list(self.files.keys())
-        directory = os.path.dirname(self.files[files[0]]['path'])
-        raw_codes = {f: self.files[f]['content'] for f in files}
-        processed_codes = {f: preprocess_code(self.files[f]['content']) for f in files}
-
-        n = len(files)
-        similarity_matrix = [[0.0] * n for _ in range(n)]
-
-        self.result_table.setRowCount(0)  # 清空表格
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                sim = compare_similarity(processed_codes[files[i]], processed_codes[files[j]])
-                similarity_matrix[i][j] = sim
-                similarity_matrix[j][i] = sim
-
-                # 更新结果表格
-                row_pos = self.result_table.rowCount()
-                self.result_table.insertRow(row_pos)
-                self.result_table.setItem(row_pos, 0, QTableWidgetItem(f"{files[i]} ⟷ {files[j]}"))
-                self.result_table.setItem(row_pos, 1, QTableWidgetItem(f"{sim * 100:.2f}%"))
-                self.result_table.setItem(row_pos, 2, QTableWidgetItem("查看报告"))
-
-                # 生成 HTML 报告
-                subdir = os.path.join(directory, os.path.splitext(files[i])[0])
-                os.makedirs(subdir, exist_ok=True)
-                html_path = os.path.join(subdir, f"{files[j]}.html")
-                generate_html_report(
-                    raw_codes[files[i]], raw_codes[files[j]],
-                    files[i], files[j],
-                    html_path
-                )
-        self.result_table.sortItems(1, Qt.DescendingOrder)
-
-        # 保存 CSV 文件
-        csv_path = os.path.join(directory, "similarity_matrix.csv")
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([""] + files)
-            for i in range(n):
-                row = [files[i]] + [f"{similarity_matrix[i][j] * 100:.2f}%" for j in range(n)]
-                writer.writerow(row)
-
-        self.status_bar.showMessage(f"查重完成！结果已保存到 {csv_path}", 5000)
-
-    def show_code_comparison(self, row, column):
-        if not hasattr(self, "current_file") or not self.current_file:
-            return
-
-        file_pair_item = self.result_table.item(row, 0)
-        if not file_pair_item:
-            return
-
-        # 文件1是当前选中的文件，文件2来自 middle 表格
-        _, file2 = file_pair_item.text().split("⟷")
-        file2 = file2.strip()
-        file1 = self.current_file
-
-        html_path = os.path.join(
-            os.path.dirname(self.files[file1]['path']),
-            os.path.splitext(file1)[0],
-            f"{file2}.html"
-        )
-
-        if not os.path.exists(html_path):
-            QMessageBox.warning(self, "报告未生成", f"找不到报告文件：\n{html_path}")
-            return
-
-        from PyQt5.QtWebEngineWidgets import QWebEngineView
-        view = QWebEngineView()
-        with open(html_path, 'r', encoding='utf-8') as f:
-            html_content = f.read()
-        view.setHtml(html_content)
-        self.code_tabs.addTab(view, f"{file1} ⟷ {file2}")
-        self.code_tabs.setCurrentWidget(view)
-
-    def calculate_similarity(self, file1, file2):
-        # 计算两个文件的代码相似度需要的操作
-        pass
 
     def display_similarity_for_file(self, row, column):
         file_clicked = self.file_table.item(row, 0).text()
         self.current_file = file_clicked
-
         self.result_table.setRowCount(0)
 
         results = []
         for other_file in self.files:
             if other_file == file_clicked:
                 continue
-            key = (file_clicked, other_file)
-            if key in self.similarity:
-                sim = self.similarity[key]
-                results.append((other_file, sim))
+            sim = compare_similarity(
+                preprocess_code(self.files[file_clicked]['content']),
+                preprocess_code(self.files[other_file]['content'])
+            )
+            results.append((other_file, sim))
 
-        # 按相似度降序排列
         results.sort(key=lambda x: x[1], reverse=True)
 
-        for other_file, sim in results:
-            row_pos = self.result_table.rowCount()
+        for row_pos, (other_file, sim) in enumerate(results):
             self.result_table.insertRow(row_pos)
-            self.result_table.setItem(row_pos, 0, QTableWidgetItem(f"{file_clicked} ⟷ {other_file}"))
+            self.result_table.setItem(row_pos, 0, QTableWidgetItem(other_file))
             self.result_table.setItem(row_pos, 1, QTableWidgetItem(f"{sim * 100:.2f}%"))
             self.result_table.setItem(row_pos, 2, QTableWidgetItem("查看报告"))
+            self.result_table.setItem(row_pos, 3, QTableWidgetItem("待审核"))
 
-    def highlight_similar_code(self, code1, code2):
-        # 高亮显示相似代码段需要的操作
-        pass
+    def show_code_comparison(self, row, column):
+        if not hasattr(self, "current_file") or not self.current_file:
+            return
 
+        file1 = self.current_file
+        file2 = self.result_table.item(row, 0).text()
 
-    def save_to_history(self, files):
-        # 保存到历史记录需要的操作
-        pass
+        file1_id = self.files[file1].get("file_id")
+        file2_id = self.files[file2].get("file_id")
+        if not file1_id or not file2_id:
+            QMessageBox.warning(self, "文件ID缺失", f"{file1} 或 {file2} 缺少 file_id")
+            return
 
+        try:
+            api_url = "http://101.201.83.112:8080/api/plagiarism/query/fileresult/"
+            payload = {
+                "file_id_list": [
+                    {
+                        "main_file_id": file1_id,
+                        "sub_file_id": file2_id
+                    }
+                ]
+            }
+            response = requests.post(api_url, json=payload, timeout=10)
+            if response.status_code == 200:
+                result_data = response.json()
+                if result_data.get("success") and result_data.get("results"):
+                    result_url = result_data["results"][0].get("result_url")
+                    if result_url:
+                        html_content = requests.get(result_url).text
+                    else:
+                        QMessageBox.warning(self, "无返回报告", "后端未返回 result_url")
+                        return
+                else:
+                    QMessageBox.warning(self, "后端返回异常", f"数据格式错误或为空：{result_data}")
+                    return
+            else:
+                QMessageBox.warning(self, "后端错误", f"状态码: {response.status_code}\n{response.text}")
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "网络错误", str(e))
+            return
 
-    def load_history_menu(self, menu):
-        # 加载历史记录菜单需要的操作
-        pass
+        view = QWebEngineView()
+        view.setHtml(html_content)
+        self.code_tabs.addTab(view, f"{file1} ⟷ {file2}")
+        self.code_tabs.setCurrentWidget(view)
 
+    def run_plagiarism_check(self):
+        file_ids = [info["file_id"] for info in self.files.values() if info["file_id"]]
+        if not file_ids:
+            QMessageBox.warning(self, "缺少文件ID", "请先上传并获取文件ID")
+            return
 
-    def switch_to_group_mode(self):
-        # 切换到群体自查模式需要的操作
-        pass
+        payload = {
+            "user_id": 123,
+            "user_name": "user",
+            "task_name": "查重任务",
+            "mode": self.mode
+        }
 
-
-    def export_results(self):
-        # 导出结果需要的操作
-        pass
-
+        if self.mode == 0:
+            print(f'self.files is {self.files}')
+            payload["file_id_list"] = [file_info["file_id"] for file_info in self.files.values()]
+        print(f'payload is {payload}')
+        try:
+            url = "http://101.201.83.112:8080/api/plagiarism/check/"
+            response = requests.post(url, json=payload, timeout=10, proxies={})
+            if response.status_code == 200:
+                QMessageBox.information(self, "任务已提交", "查重任务已提交成功！")
+            else:
+                print('error')
+                QMessageBox.warning(self, "提交失败", f"后端返回: {response.status_code}\n{response.text}")
+        except Exception as e:
+            QMessageBox.critical(self, "提交错误", str(e))
 
 def main():
     app = QApplication(sys.argv)
-    ex = CodePlagiarismChecker()
-    ex.show()
+    window = CodePlagiarismChecker()
+    window.show()
     sys.exit(app.exec_())
 
 if __name__ == '__main__':
