@@ -11,6 +11,9 @@ from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 
+from urllib.parse import urlsplit
+
+
 def preprocess_code(code):
     code = re.sub(r'#.*?$|\'\'\'.*?\'\'\'|""".*?"""', '', code, flags=re.DOTALL | re.MULTILINE)
     code = re.sub(r'\s+', ' ', code)
@@ -27,7 +30,10 @@ class CodePlagiarismChecker(QMainWindow):
 
         self.files = {}
         self.current_file = None
-        self.mode = 0  # 默认为一对多模式
+        self.mode = 0
+        self.task_count = 0
+        self.threshold = 10.0  # 新增：默认重复率阈值
+        self.suspected_pairs = []  # 新增：用于记录可导出的抄袭文件对
 
         self.CreateUI()
         self.show_login_time()
@@ -43,8 +49,19 @@ class CodePlagiarismChecker(QMainWindow):
         self.btn_import.clicked.connect(self.import_files)
         self.btn_check = QPushButton("开始查重")
         self.btn_check.clicked.connect(self.run_plagiarism_check)
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0, 100)
+        self.threshold_spin.setValue(self.threshold)
+        self.threshold_spin.setSuffix("% 阈值")
+        self.threshold_spin.valueChanged.connect(lambda val: setattr(self, 'threshold', val))
+
+        self.btn_export = QPushButton("导出抄袭文件")
+        self.btn_export.clicked.connect(self.export_suspected_files)
+
         control_layout.addWidget(self.btn_import)
         control_layout.addWidget(self.btn_check)
+        control_layout.addWidget(self.threshold_spin)
+        control_layout.addWidget(self.btn_export)
         main_layout.addLayout(control_layout)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -77,33 +94,45 @@ class CodePlagiarismChecker(QMainWindow):
         self.create_menus()
 
     def create_menus(self):
-        file_menu = self.menuBar().addMenu("文件")
+        menu_bar = self.menuBar()
 
+        # 文件菜单
+        file_menu = menu_bar.addMenu("文件")
         import_action = QAction("导入文件", self)
         import_action.triggered.connect(self.import_files)
         file_menu.addAction(import_action)
 
-        export_action = QAction("导出结果", self)
-        file_menu.addAction(export_action)
-
+        # 历史记录菜单（一级）
         history_menu = self.menuBar().addMenu("历史记录")
+        query_action = QAction("查询历史任务", self)
+        query_action.triggered.connect(self.query_history)
+        history_menu.addAction(query_action)
 
-        view_menu = self.menuBar().addMenu("查看")
-        self.mode_label = QLabel("当前: 一对多模式")
-        mode_widget_action = QWidgetAction(self)
-        mode_widget_action.setDefaultWidget(self.mode_label)
-        view_menu.addAction(mode_widget_action)
+        # 模式菜单
+        mode_menu = menu_bar.addMenu("模式切换")
+        self.one_to_many_action = QAction("一对多模式", self, checkable=True)
+        self.group_action = QAction("群体自查模式", self, checkable=True)
 
-        one_to_many_action = QAction("一对多模式", self)
-        one_to_many_action.triggered.connect(lambda: self.switch_mode(0))
-        group_action = QAction("群体自查模式", self)
-        group_action.triggered.connect(lambda: self.switch_mode(1))
-        view_menu.addAction(one_to_many_action)
-        view_menu.addAction(group_action)
+        self.one_to_many_action.triggered.connect(lambda: self.switch_mode(0))
+        self.group_action.triggered.connect(lambda: self.switch_mode(1))
+
+        mode_menu.addAction(self.one_to_many_action)
+        mode_menu.addAction(self.group_action)
+
+        self.update_mode_checkmark()
+
+    def check_history(self):
+        pass
+
+    def update_mode_checkmark(self):
+        if hasattr(self, 'one_to_many_action') and hasattr(self, 'group_action'):
+            self.one_to_many_action.setChecked(self.mode == 0)
+            self.group_action.setChecked(self.mode == 1)
 
     def switch_mode(self, mode):
         self.mode = mode
-        self.mode_label.setText("当前: 一对多模式" if mode == 0 else "当前: 群体自查模式")
+        self.update_mode_checkmark()
+        self.status_bar.showMessage(f"已切换到 {'一对多' if mode == 0 else '群体自查'} 模式")
 
     def show_login_time(self):
         login_time = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
@@ -231,6 +260,7 @@ class CodePlagiarismChecker(QMainWindow):
             response = requests.post(api_url, json=payload, timeout=10)
             if response.status_code == 200:
                 result_data = response.json()
+                print(result_data)
                 if result_data.get("success") and result_data.get("results"):
                     result_url = result_data["results"][0].get("result_url")
                     if result_url:
@@ -272,7 +302,7 @@ class CodePlagiarismChecker(QMainWindow):
         print(f'payload is {payload}')
         try:
             url = "http://101.201.83.112:8080/api/plagiarism/check/"
-            response = requests.post(url, json=payload, timeout=10, proxies={})
+            response = requests.post(url, json=payload, timeout=1000, proxies={})
             if response.status_code == 200:
                 QMessageBox.information(self, "任务已提交", "查重任务已提交成功！")
             else:
@@ -280,6 +310,156 @@ class CodePlagiarismChecker(QMainWindow):
                 QMessageBox.warning(self, "提交失败", f"后端返回: {response.status_code}\n{response.text}")
         except Exception as e:
             QMessageBox.critical(self, "提交错误", str(e))
+
+        self.suspected_pairs.clear()
+        self.result_table.setRowCount(0)
+        files = list(self.files.items())
+        for i in range(len(files)):
+            for j in range(i + 1, len(files)):
+                name1, info1 = files[i]
+                name2, info2 = files[j]
+                sim = compare_similarity(
+                    preprocess_code(info1['content']),
+                    preprocess_code(info2['content'])
+                )
+                tag = "是" if sim * 100 >= self.threshold else "否"
+                if tag == "是" and info1['file_id'] and info2['file_id']:
+                    self.suspected_pairs.append({
+                        "main_file_id": info1['file_id'],
+                        "sub_file_id": info2['file_id']
+                    })
+
+                row_pos = self.result_table.rowCount()
+                self.result_table.insertRow(row_pos)
+                self.result_table.setItem(row_pos, 0, QTableWidgetItem(f"{name1} ⟷ {name2}"))
+                self.result_table.setItem(row_pos, 1, QTableWidgetItem(f"{sim*100:.2f}%"))
+                self.result_table.setItem(row_pos, 2, QTableWidgetItem(tag))
+                self.result_table.setItem(row_pos, 3, QTableWidgetItem("待审核"))
+
+        self.status_bar.showMessage(f"查重完成，共检测出 {len(self.suspected_pairs)} 对疑似抄袭")
+
+    def query_history(self):
+        api_url = "http://101.201.83.112:8080/api/plagiarism/his/query/list/"
+        payload = {
+            "user_id": 123,
+            "category": self.mode,
+            "sort_time": 0,
+            "sort_check": 0,
+            "task_name": "",
+            "file_name": ""
+        }
+        try:
+            response = requests.post(api_url, json=payload, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success"):
+                    task_list = data.get("data", [])
+                    menu = QMenu()
+                    for task in task_list:
+                        task_id = task["task_name"]
+                        task_name = task.get("task_name", "无名任务")
+                        create_time = task.get("create_time", "")
+                        display_text = f"任务 {task_name} (ID: {task_id}) ({create_time})"
+                        action = QAction(display_text, self)
+                        action.triggered.connect(lambda checked, tid=task_id: self.load_task_by_id(tid))
+                        menu.addAction(action)
+                    menu.exec_(QCursor.pos())
+                else:
+                    QMessageBox.warning(self, "查询失败", f"后端未返回成功: {data}")
+            else:
+                QMessageBox.warning(self, "网络错误", f"状态码: {response.status_code}\n{response.text}")
+        except Exception as e:
+            QMessageBox.critical(self, "异常", str(e))
+
+    def load_task_by_id(self, task_id):
+        api_url = f"http://101.201.83.112:8080/api/plagiarism/his/query/{task_id}"
+        try:
+            response = requests.get(api_url, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success"):
+                    task_data = data["data"]
+                    self.files.clear()
+                    for group in task_data.get("all_result", []):
+                        main_id = group.get("main_file_id")
+                        filename = str(main_id)
+                        self.files[filename] = {"file_id": main_id, "content": "历史内容"}
+                    self.display_files()
+                else:
+                    QMessageBox.warning(self, "加载失败", "后端返回失败标志")
+            else:
+                QMessageBox.warning(self, "请求失败", f"状态码: {response.status_code}\n{response.text}")
+        except Exception as e:
+            QMessageBox.critical(self, "网络错误", str(e))
+
+    def export_suspected_files(self):
+        if not self.suspected_pairs:
+            QMessageBox.information(self, "无抄袭记录", "当前没有可导出的抄袭文件对")
+            return
+
+        # 获取用户保存路径
+        save_dir = QFileDialog.getExistingDirectory(self, "选择保存目录")
+        if not save_dir:
+            return
+
+        # 发送 POST 请求到后端
+        api_url = "http://101.201.83.112:8080/api/plagiarism/output/file/"
+        payload = {
+            "file_id_list": self.suspected_pairs
+        }
+
+        try:
+            print("=== 开始导出 ===")
+            print(f'api_url:{payload}')
+
+            response = requests.post(api_url, json=payload, timeout=30)
+            print("响应状态码:", response.status_code)
+            print("响应内容:", response.text)
+
+            data = response.json()
+            print("解析结果:", data)
+
+            for item in data.get("results", []):
+                print("单项数据:", item)
+            if response.status_code == 200:
+                data = response.json()
+                if not data.get("success"):
+                    QMessageBox.warning(self, "后端返回失败", data.get("message", "未知错误"))
+                    return
+
+                results = data.get("results", [])
+                count = 0
+
+                for item in results:
+                    if not item.get("success"):
+                        continue
+
+                    html_url = item["comparison_result"].get("html_url")
+                    main_name = item["main_file"]["name"]
+                    sub_name = item["sub_file"]["name"]
+                    filename = f"{main_name}_{sub_name}.html"
+
+                    try:
+                        html_data = requests.get(html_url, timeout=10).text
+                        file_path = os.path.join(save_dir, filename)
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.write(html_data)
+                        count += 1
+                    except Exception as e:
+                        print(f"下载失败：{html_url}，错误：{e}")
+                        continue
+
+                QMessageBox.information(self, "导出成功", f"已成功导出 {count} 个HTML报告文件")
+            else:
+                QMessageBox.warning(self, "请求失败", f"状态码: {response.status_code}\n{response.text}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出异常", str(e))
+
+    def start_check(self):
+        pass
+
+
+
 
 def main():
     app = QApplication(sys.argv)
